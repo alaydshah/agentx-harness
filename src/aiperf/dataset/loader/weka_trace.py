@@ -223,17 +223,13 @@ def _trace_peak_context_length(trace: WekaTrace, max_osl: int | None = None) -> 
             )
         elif isinstance(req, WekaSubagentEntry):
             for child_req in req.requests:
-                # Subagent child turns emit the RECORDED output_length (they are
-                # deliberately NOT subject to --synthesis-max-osl; see the child emission
-                # in _reconstruct_serial / the parallel worker child loop). The
-                # keep/drop decision must use that same uncapped output, or a
-                # trace that fits only under the cap would be kept and then 4xx
-                # mid-run on the uncapped subagent request. Zero still upgrades to
-                # 1 at emission, so peak must match the wire max_tokens.
+                # Every Weka wire turn honors --synthesis-max-osl. Keep the
+                # authored output_length unchanged for static assistant-message
+                # reconstruction, but use the capped wire budget for filtering.
                 peak = max(
                     peak,
                     child_req.input_length
-                    + _peak_output_tokens(child_req.output_length, max_osl=None),
+                    + _peak_output_tokens(child_req.output_length, max_osl=max_osl),
                 )
     return peak
 
@@ -1986,9 +1982,7 @@ class WekaTraceLoader(HashIdsPromptSynthesisMixin, BaseFileLoader):
                         source_inner_idx=cp.request_inner_indices[k],
                         source_kind="weka_subagent",
                         model=child_model_map.get(creq.model, creq.model),
-                        max_tokens=(
-                            creq.output_length if creq.output_length >= 1 else 1
-                        ),
+                        max_tokens=self._cap_output(creq),
                         raw_messages=child_delta.delta_messages,
                         reset_context=child_delta.reset_context,
                         theoretical_prefix_cache_hit_blocks=theoretical_hit_blocks,
@@ -2187,6 +2181,7 @@ class WekaTraceLoader(HashIdsPromptSynthesisMixin, BaseFileLoader):
                     "input_kind": _classify_turn_input(
                         creq, cp.requests[k - 1] if k else None
                     ),
+                    "capped_output_length": self._cap_output(creq),
                 }
                 requests_dicts.append(req_payload)
             children_by_trace[cp.parent_trace_id].append(

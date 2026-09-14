@@ -688,10 +688,9 @@ def _process_task(task: _WekaTraceTask) -> _WekaProcessTaskResult:
                     "source_inner_idx": creq.get("source_inner_idx"),
                     "source_kind": creq.get("source_kind", "weka_subagent"),
                     "model": task.model_map.get(creq["model"], creq["model"]),
-                    # Flat-chain children carry capped_output_length (their
-                    # rows were top-level and honor --max-osl); subagent
-                    # children keep the recorded output_length. Clamp 0→1
-                    # so Turn.max_tokens (ge=1) accepts aborted captures.
+                    # Every Weka wire turn carries capped_output_length while
+                    # output_length remains the authored budget used to rebuild
+                    # static assistant messages. Clamp 0→1 for aborted captures.
                     "max_tokens": max(
                         1,
                         creq.get("capped_output_length", creq["output_length"]),

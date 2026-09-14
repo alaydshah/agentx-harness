@@ -81,6 +81,7 @@ class CreditIssuer:
         session_tree_registry: SessionTreeRegistry | None = None,
         session_tree_registry_enabled: bool | None = None,
         replay_barrier: ReplayBarrierCoordinator | None = None,
+        defer_session_target_completion: bool = False,
     ) -> None:
         """Initialize credit issuer.
 
@@ -99,6 +100,10 @@ class CreditIssuer:
                 slot acquired for a root (or a lane credit) opens a tree so the
                 slot is held until the whole tree drains. None elsewhere (legacy
                 per-root-credit release).
+            defer_session_target_completion: Keep issuing admitted-tree work
+                after the root-session target is reached. ``PhaseRunner`` owns
+                the final quiescence signal in this mode; request-count caps
+                remain immediate hard caps.
         """
         self._phase = phase
         self._phase_index = phase_index
@@ -129,6 +134,7 @@ class CreditIssuer:
         self._max_tokens_override: int | None = None
         self._turn_admission: Callable[[TurnToSend], TurnAdmission | bool] | None = None
         self.replay_gate = ReplayIssueGate(replay_barrier)
+        self._defer_session_target_completion = defer_session_target_completion
 
     def set_turn_admission(
         self, callback: Callable[[TurnToSend], TurnAdmission | bool]
@@ -252,6 +258,22 @@ class CreditIssuer:
                 turn.effective_root_correlation_id, self._phase_key, root_pending=True
             )
 
+    def _child_tree_is_admitted(self, turn: TurnToSend) -> bool:
+        """Whether a descendant belongs to an already-admitted runtime tree.
+
+        Pre-session children have no root id and retain their existing path.
+        Every snapshot/live descendant carrying a root id must find the tree
+        slot opened by its root or lane admission before it may reach the wire.
+        """
+        return (
+            self._phase != CreditPhase.PROFILING
+            or self._session_tree_registry is None
+            or turn.root_correlation_id is None
+            or self._session_tree_registry.has_tree(
+                turn.effective_root_correlation_id
+            )
+        )
+
     def release_lane_credit(self) -> None:
         """Release a session slot directly (legacy / non-registry path).
 
@@ -308,12 +330,19 @@ class CreditIssuer:
     async def _issue_credit_ready(self, turn: TurnToSend) -> bool:
         """Issue a turn whose recorded predecessor frontier is complete."""
         if self._issuing_stopped:
-            return False
+            return self._turn_retained_at_stop(turn)
 
         # A session start is turn 0 OR an agentic mid-trace resume (flagged via
         # is_session_start, only emitted at a phase's initial dispatch).
         is_session_start = turn.turn_index == 0 or turn.is_session_start
         is_child = turn.agent_depth > 0
+        if is_child and not self._child_tree_is_admitted(turn):
+            _logger.error(
+                "Rejecting descendant for unadmitted tree root=%r child=%r",
+                turn.effective_root_correlation_id,
+                turn.x_correlation_id,
+            )
+            return False
 
         # Select appropriate check function based on turn type.
         # - Root session starts need can_start_new_session (session-quota check).
@@ -332,6 +361,8 @@ class CreditIssuer:
                 if is_session_start
                 else self._stop_checker.can_send_any_turn
             )
+        if not can_proceed_fn():
+            return self._turn_retained_at_stop(turn)
 
         # Session concurrency: one slot per root conversation, acquired on its
         # first credit in the phase (turn 0, or a mid-trace resume). DAG
@@ -343,7 +374,7 @@ class CreditIssuer:
                 self._phase_key, self._stop_checker.can_start_new_session
             )
             if not acquired:
-                return False
+                return self._turn_retained_at_stop(turn)
 
         # Prefill concurrency: one slot per request, released when TTFT arrives.
         # Limits concurrent prompt processing which is the GPU-intensive phase.
@@ -356,7 +387,7 @@ class CreditIssuer:
             # phase teardown release_all cannot double-release this slot.
             if needs_session_slot:
                 self._concurrency_manager.release_session_slot(self._phase_key)
-            return False
+            return self._turn_retained_at_stop(turn)
 
         if self._turn_admission_result(turn) is not TurnAdmission.ADMIT:
             self._concurrency_manager.release_prefill_slot(self._phase_key)
@@ -491,6 +522,15 @@ class CreditIssuer:
         if replay_gate is not None:
             await replay_gate.observe_issued(credit)
         if is_final_credit:
+            if (
+                self._defer_session_target_completion
+                and not self._progress.counter.request_cap_reached
+            ):
+                # The root-session target closes admission only. Delayed
+                # continuations, children, joins, and barrier releases from
+                # already-admitted trees remain legal. PhaseRunner freezes the
+                # sent count once every generation ledger reaches quiescence.
+                return True
             self._progress.freeze_sent_counts()
             self._progress.all_credits_sent_event.set()
 
@@ -536,10 +576,17 @@ class CreditIssuer:
     async def _dispatch_child_turn_ready(self, turn: TurnToSend) -> ChildDispatchResult:
         """Dispatch a child after its recorded predecessor frontier completes."""
         if self._issuing_stopped:
+            return self._child_disposition_at_stop(turn)
+        if not self._child_tree_is_admitted(turn):
+            _logger.error(
+                "Rejecting descendant for unadmitted tree root=%r child=%r",
+                turn.effective_root_correlation_id,
+                turn.x_correlation_id,
+            )
             return ChildDispatchResult.REJECTED
         can_proceed_fn = self._stop_checker.can_send_child_turn
         if not can_proceed_fn():
-            return ChildDispatchResult.REJECTED
+            return self._child_disposition_at_stop(turn)
         # Children inherit the parent's session slot; wait for prefill
         # capacity so temporary saturation does not delete sibling branches.
         if not await self._concurrency_manager.acquire_prefill_slot(
@@ -556,6 +603,25 @@ class CreditIssuer:
             turn = _struct_replace(turn, counts_toward_phase_target=False)
         await self._issue_credit_internal(turn)
         return ChildDispatchResult.ISSUED
+
+    def _child_disposition_at_stop(self, turn: TurnToSend) -> ChildDispatchResult:
+        """Preserve a quota-handoff child even after the wire cap closes.
+
+        A replay barrier can pop a ready child into a dispatch task just before
+        the final warmup credit reaches its cap. The task is no longer in the
+        barrier pending map when it observes the stop condition. Give the
+        strategy's admission hook one chance to retain it for phase handoff;
+        every non-deferred result remains a terminal rejection.
+        """
+        return (
+            ChildDispatchResult.DEFERRED
+            if self._turn_retained_at_stop(turn)
+            else ChildDispatchResult.REJECTED
+        )
+
+    def _turn_retained_at_stop(self, turn: TurnToSend) -> bool:
+        """Let an admission hook move a cap-racing turn into phase handoff."""
+        return self._turn_admission_result(turn) is TurnAdmission.DEFER
 
     async def dispatch_join_turn(self, pending: PendingBranchJoin) -> bool:
         """Dispatch a parent's gated turn after all its children complete.

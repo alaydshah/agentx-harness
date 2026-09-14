@@ -1763,6 +1763,16 @@ class RecordsManager(PullClientMixin, BaseComponentService):
         for profiling_index, phase_config in enumerate(phase_configs):
             if phase_config.duration is None:
                 continue
+            if (
+                isinstance(phase_config.sessions, int)
+                and phase_config.sessions > 0
+            ):
+                self.info(
+                    "Skipping duration-tail metric coverage validation for "
+                    f"{phase_config.name!r}: the {float(phase_config.duration):.1f}s "
+                    "duration is a safety ceiling on a fixed-session phase."
+                )
+                continue
             if phase_config.duration < scenario_spec.min_benchmark_duration_seconds:
                 self.info(
                     "Skipping profiling metric coverage validation for "
