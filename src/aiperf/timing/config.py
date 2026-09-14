@@ -133,6 +133,13 @@ class TimingConfig(AIPerfBaseModel):
         "per-trajectory start position, as a fraction of the trace's total "
         "turn count. Effective per-trace ceiling is min(int(max_ratio * n), n - 2).",
     )
+    agentic_live_sessions: int = Field(
+        default=1,
+        ge=1,
+        description="AGENTIC_REPLAY: live session trees per concurrency lane "
+        "(``--agentic-live-sessions``). TrajectorySource builds concurrency x "
+        "this many trees; 1 is the classic one tree per lane.",
+    )
     allow_dataset_wrap: bool = Field(
         default=False,
         description="Allow AGENTIC_REPLAY to reuse distinct eligible traces "
@@ -200,6 +207,7 @@ class TimingConfig(AIPerfBaseModel):
         concurrency = getattr(first_profiling, "concurrency", None)
         trajectory_min = getattr(first_profiling, "trajectory_start_min_ratio", 0.25)
         trajectory_max = getattr(first_profiling, "trajectory_start_max_ratio", 0.75)
+        live_sessions = getattr(first_profiling, "agentic_live_sessions", 1) or 1
         synthesis = getattr(cfg.get_default_dataset(), "synthesis", None)
         allow_dataset_wrap = bool(
             getattr(synthesis, "allow_dataset_wrap", False) if synthesis else False
@@ -215,6 +223,7 @@ class TimingConfig(AIPerfBaseModel):
             random_seed=run.random_seed,
             trajectory_start_min_ratio=trajectory_min,
             trajectory_start_max_ratio=trajectory_max,
+            agentic_live_sessions=live_sessions,
             allow_dataset_wrap=allow_dataset_wrap,
             cache_bust_enabled=cache_bust_enabled,
         )
@@ -365,6 +374,15 @@ class CreditPhaseConfig(AIPerfBaseModel):
         description="Deterministic cache-pressure warmup wire-request budget "
         "per live agentic replay lane. Mutually exclusive with "
         "agentic_cache_warmup_duration_sec.",
+    )
+    agentic_live_sessions: int = Field(
+        default=1,
+        ge=1,
+        description="AGENTIC_REPLAY: live session trees per dispatch lane "
+        "(``--agentic-live-sessions``). ``concurrency`` on this model already "
+        "counts every tree (user concurrency x this value); the PROFILING "
+        "strategy bounds main-agent requests in flight to user concurrency "
+        "via ``LaneRotationGate``. 1 is the classic one tree per lane.",
     )
 
     artifact_dir: Path | None = Field(
@@ -626,7 +644,7 @@ def _build_agentic_warmup_config(phase: PhaseConfig) -> CreditPhaseConfig | None
     benchmark grace period (resolved onto the profiling phase's
     ``grace_period``) caps the drain instead.
     """
-    concurrency = getattr(phase, "concurrency", None)
+    concurrency = _session_slot_concurrency(phase)
     grace_period = _agentic_warmup_grace_period(phase)
     cache_warmup_duration = getattr(phase, "agentic_cache_warmup_duration", None)
     requests_per_lane = getattr(phase, "warmup_requests_per_lane", None)
@@ -659,7 +677,28 @@ def _build_agentic_warmup_config(phase: PhaseConfig) -> CreditPhaseConfig | None
         grace_period_sec=grace_period if grace_period is not None else float("inf"),
         agentic_cache_warmup_duration_sec=cache_warmup_duration,
         warmup_requests_per_lane=requests_per_lane,
+        agentic_live_sessions=_agentic_live_sessions(phase),
     )
+
+
+def _agentic_live_sessions(phase: PhaseConfig) -> int:
+    """``--agentic-live-sessions`` of a phase (1 when unset / non-agentic)."""
+    live = getattr(phase, "agentic_live_sessions", 1)
+    return live if isinstance(live, int) and live >= 1 else 1
+
+
+def _session_slot_concurrency(phase: PhaseConfig) -> int | None:
+    """Session slots for a phase: ``concurrency`` x ``agentic_live_sessions``.
+
+    Under ``--agentic-live-sessions K`` every one of the concurrency x K live
+    trees holds its own session slot; the main-agent in-flight bound stays at
+    the user's concurrency, enforced per dispatch lane by ``LaneRotationGate``.
+    K is 1 for every other timing mode, so this is ``phase.concurrency`` there.
+    """
+    concurrency = getattr(phase, "concurrency", None)
+    if concurrency is None:
+        return None
+    return concurrency * _agentic_live_sessions(phase)
 
 
 def _build_profiling_config(
@@ -692,7 +731,8 @@ def _build_profiling_config(
         expected_duration_sec=phase.duration,
         total_expected_requests=phase.requests,
         expected_num_sessions=phase.sessions,
-        concurrency=phase.concurrency,
+        concurrency=_session_slot_concurrency(phase),
+        agentic_live_sessions=_agentic_live_sessions(phase),
         prefill_concurrency=phase.prefill_concurrency,
         request_rate=_phase_request_rate(phase),
         arrival_pattern=_phase_arrival_pattern(phase),

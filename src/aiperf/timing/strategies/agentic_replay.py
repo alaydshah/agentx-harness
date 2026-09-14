@@ -74,6 +74,7 @@ from aiperf.common.scenario.context_overflow import is_context_overflow_response
 from aiperf.credit.dispatch import ChildDispatchResult, TurnAdmission
 from aiperf.credit.structs import TurnToSend
 from aiperf.timing.conversation_source import SampledSession
+from aiperf.timing.lane_rotation import LaneRotationGate
 from aiperf.timing.replay_dependencies import ReplayResumeBoundary
 from aiperf.timing.trajectory_source import (
     ConversationState,
@@ -190,6 +191,19 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             if isinstance(cache_warmup_requests_per_lane, int)
             else None
         )
+        # ``--agentic-live-sessions K`` (wave round-robin): K consecutive
+        # trajectory indices share one dispatch lane. The PROFILING strategy
+        # installs a ``LaneRotationGate`` on the credit issuer so at most one
+        # main-agent request per dispatch lane is on the wire while all
+        # concurrency x K trees stay live. K == 1 installs nothing and leaves
+        # every existing path untouched (``isinstance`` guards MagicMock configs).
+        live_sessions = getattr(config, "agentic_live_sessions", 1)
+        self._live_sessions_per_lane: int = (
+            live_sessions
+            if isinstance(live_sessions, int) and live_sessions > 1
+            else 1
+        )
+        self._lane_gate: LaneRotationGate | None = None
         self._cache_warmup_requests_by_lane: Counter[int] = Counter()
         self._cache_warmup_selected_by_lane: dict[
             int, set[tuple[str, str, int]]
@@ -428,6 +442,20 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             for trajectory in self.conversation_source.trajectories:
                 self._seed_trajectory_replay_prefix(trajectory)
             self.credit_issuer.replay_gate.activate()
+            if self._live_sessions_per_lane > 1:
+                self._lane_gate = LaneRotationGate(
+                    lane_of=self._dispatch_lane_for_root,
+                    run_soon=lambda coro: self.scheduler.schedule_later(0.0, coro),
+                )
+                self.credit_issuer.set_root_dispatch_gate(self._lane_gate)
+                tree_count = len(self.conversation_source.trajectories)
+                lane_count = -(-tree_count // self._live_sessions_per_lane)
+                self.info(
+                    f"PROFILING wave rotation: {lane_count} dispatch lanes x "
+                    f"{self._live_sessions_per_lane} live sessions per lane "
+                    f"({tree_count} trees); one main-agent request in flight per "
+                    "lane, rotating in arrival order"
+                )
             if not self.conversation_source.trajectories:
                 raise RuntimeError(
                     "AgenticReplayStrategy PROFILING setup: trajectories empty. "
@@ -447,6 +475,19 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                     f"still count toward concurrency); rootless lanes recycle into a "
                     f"fresh root once their background subagents drain"
                 )
+
+    def _dispatch_lane_for_root(self, root_correlation_id: str) -> int | None:
+        """Dispatch lane of a tree: its trajectory index // live sessions per lane.
+
+        Both lane maps hold the TRAJECTORY index (one per tree); K consecutive
+        trees form one dispatch lane under ``--agentic-live-sessions K``.
+        """
+        index = self._correlation_to_lane.get(root_correlation_id)
+        if index is None:
+            index = self._root_to_lane.get(root_correlation_id)
+        if index is None:
+            return None
+        return index // self._live_sessions_per_lane
 
     def _cache_warmup_lane(self, turn_or_credit: TurnToSend | Credit) -> int:
         """Resolve a warmup turn or credit to its stable trajectory lane."""
@@ -1009,6 +1050,10 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
     def observe_credit_return(self, credit: Credit) -> None:
         """Track the next live turn for the warmup-to-profile handoff."""
         self.credit_issuer.replay_gate.complete(credit)
+        if self._lane_gate is not None:
+            # Frees the returning tree's dispatch lane and admits the next
+            # queued main-agent turn (the wave rotation step).
+            self._lane_gate.observe_returned(credit)
         if not self._accelerated_warmup_started:
             return
         root_correlation_id = credit.effective_root_correlation_id
@@ -1108,6 +1153,12 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 f"limit={self._system_idle_gap_cap_seconds:g}s, "
                 f"jumps={self._system_idle_jump_count}, "
                 f"skipped={self._system_idle_seconds_skipped:.3f}s"
+            )
+        if self._lane_gate is not None:
+            self.info(
+                "Wave rotation summary (per dispatch lane: issued, returned, "
+                f"still queued): {self._lane_gate.ledger()}; "
+                f"ungated={self._lane_gate.unresolved_count}"
             )
         if not self._accelerated_warmup_started:
             return

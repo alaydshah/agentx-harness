@@ -243,10 +243,16 @@ class TrajectorySource(ConversationSource):
         total_expected_requests: int | None = None,
         expected_duration_sec: float | None = None,
         cache_bust_enabled: bool = False,
+        live_sessions_per_lane: int = 1,
     ) -> None:
         super().__init__(
             dataset_metadata=dataset_metadata, dataset_sampler=dataset_sampler
         )
+
+        if live_sessions_per_lane < 1:
+            raise ValueError(
+                f"live_sessions_per_lane ({live_sessions_per_lane}) must be >= 1."
+            )
 
         if not dataset_metadata.conversations:
             raise EmptyTracePoolError(
@@ -269,7 +275,7 @@ class TrajectorySource(ConversationSource):
         )
         validate_dataset_wrap_policy(
             distinct=pool_size,
-            concurrency=concurrency,
+            concurrency=concurrency * live_sessions_per_lane,
             allow_dataset_wrap=allow_dataset_wrap,
             expected_num_sessions=expected_num_sessions,
             total_expected_requests=total_expected_requests,
@@ -277,6 +283,7 @@ class TrajectorySource(ConversationSource):
             cache_bust_enabled=cache_bust_enabled,
         )
         self._concurrency = concurrency
+        self._live_sessions_per_lane = live_sessions_per_lane
         self._pool_size = pool_size
         self._allow_dataset_wrap = allow_dataset_wrap
         self._children_by_parent: dict[str, set[str]] = self._build_child_index()
@@ -290,7 +297,11 @@ class TrajectorySource(ConversationSource):
         # Wrapping requires ``allow_dataset_wrap``, an active cache-bust target,
         # or a one-pass / in-corpus session budget; see
         # ``validate_dataset_wrap_policy``.
-        self._target_size = concurrency
+        # ``--agentic-live-sessions K`` (wave round-robin) builds K trees per
+        # concurrency lane: trajectory index i belongs to dispatch lane i // K
+        # (``LaneRotationGate``). K == 1 is exactly the classic one-per-lane
+        # list -- same sampler draws, same per-index t* seeds.
+        self._target_size = concurrency * live_sessions_per_lane
         self.trajectories: list[Trajectory] = self._build_trajectories()
 
         if not self.trajectories:
@@ -309,17 +320,22 @@ class TrajectorySource(ConversationSource):
                 distinct,
                 len(self.trajectories) / distinct,
             )
-        if len(self.trajectories) < concurrency:
+        if len(self.trajectories) < self._target_size:
             _logger.warning(
                 "Built %d trajectories for concurrency=%d: the sampler could not "
                 "supply enough spawnable traces (pool too small / too many "
                 "unspawnable traces). Effective load is capped at %d lanes.",
                 len(self.trajectories),
-                concurrency,
+                self._target_size,
                 len(self.trajectories),
             )
 
         self._log_trajectory_summary()
+
+    @property
+    def live_sessions_per_lane(self) -> int:
+        """Trees per dispatch lane (``--agentic-live-sessions``; 1 = classic)."""
+        return getattr(self, "_live_sessions_per_lane", 1)
 
     @property
     def cache_bust_ledger(self) -> CacheBustLedger:
@@ -415,6 +431,14 @@ class TrajectorySource(ConversationSource):
             len(self.trajectories),
             self._pool_size,
         )
+        if self.live_sessions_per_lane > 1:
+            _logger.info(
+                "  wave rotation: %d dispatch lanes x %d live sessions per lane "
+                "(trajectory i -> dispatch lane i // %d)",
+                self._concurrency,
+                self.live_sessions_per_lane,
+                self.live_sessions_per_lane,
+            )
         _logger.info(obs_line)
         for row in rows:
             _logger.info(row)

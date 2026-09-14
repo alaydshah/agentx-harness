@@ -2152,6 +2152,23 @@ class CLIConfig(BaseConfig):
         ),
     ] = 0.75
 
+    agentic_live_sessions: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="AGENTIC_REPLAY only: live session trees per concurrency "
+            "lane (wave round-robin). With `--concurrency 3 --agentic-live-sessions 4` "
+            "12 sessions are live and each of the 3 lanes issues one main-agent turn "
+            "from each of its 4 sessions in rotation, so at most 3 main-agent "
+            "requests are in flight. Subagents run under their tree as usual. "
+            "Default 1 = one session per lane (classic behaviour).",
+        ),
+        CLIParameter(
+            name=("--agentic-live-sessions",),
+            group=Groups.LOAD_GENERATOR,
+        ),
+    ] = 1
+
     burst_phase_starts: Annotated[
         bool,
         Field(

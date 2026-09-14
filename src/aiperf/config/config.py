@@ -606,6 +606,44 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
         return self
 
     @model_validator(mode="after")
+    def validate_agentic_live_sessions(self) -> Self:
+        """Restrict ``--agentic-live-sessions`` > 1 to the agentic_replay timing mode.
+
+        Same rationale and resolution order as ``validate_agentic_cache_warmup``:
+        the value is consumed only by the agentic trajectory builder and
+        strategy, so anywhere else it would be a silent no-op.
+        """
+        from aiperf.plugin.enums import TimingMode
+        from aiperf.timing.config import _is_agentic_replay
+
+        profiling_phases = self.get_profiling_phases()
+        if all(
+            getattr(phase, "agentic_live_sessions", 1) == 1
+            for phase in profiling_phases
+        ):
+            return self
+
+        if self.scenario is not None:
+            from aiperf.common.scenario.registry import get_scenario
+
+            scenario_timing_mode = get_scenario(self.scenario).timing_mode
+            if scenario_timing_mode != TimingMode.AGENTIC_REPLAY:
+                raise ValueError(
+                    "--agentic-live-sessions > 1 requires the agentic_replay "
+                    f"timing mode; scenario {self.scenario!r} locks "
+                    f"timing_mode={scenario_timing_mode}."
+                )
+            return self
+
+        if not _is_agentic_replay(profiling_phases):
+            raise ValueError(
+                "--agentic-live-sessions > 1 requires the agentic_replay timing "
+                "mode (set today by --scenario inferencex-agentx-mvp); the "
+                "profiling phase(s) are not agentic_replay."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_agentic_cache_warmup(self) -> Self:
         """Restrict accelerated cache warmup to the agentic_replay timing mode.
 

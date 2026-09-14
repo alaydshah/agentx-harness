@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from aiperf.timing.branch_orchestrator import PendingBranchJoin
     from aiperf.timing.concurrency import ConcurrencyManager
     from aiperf.timing.conversation_source import SampledSession
+    from aiperf.timing.lane_rotation import LaneRotationGate
     from aiperf.timing.phase.lifecycle import PhaseLifecycle
     from aiperf.timing.phase.progress_tracker import PhaseProgressTracker
     from aiperf.timing.phase.stop_conditions import StopConditionChecker
@@ -135,6 +136,13 @@ class CreditIssuer:
         self._turn_admission: Callable[[TurnToSend], TurnAdmission | bool] | None = None
         self.replay_gate = ReplayIssueGate(replay_barrier)
         self._defer_session_target_completion = defer_session_target_completion
+        # ``--agentic-live-sessions`` > 1 only: per-dispatch-lane round-robin
+        # for depth-0 turns, installed by the PROFILING AgenticReplayStrategy.
+        self._root_dispatch_gate: LaneRotationGate | None = None
+
+    def set_root_dispatch_gate(self, gate: LaneRotationGate | None) -> None:
+        """Install the wave round-robin gate for main-agent (depth-0) turns."""
+        self._root_dispatch_gate = gate
 
     def set_turn_admission(
         self, callback: Callable[[TurnToSend], TurnAdmission | bool]
@@ -325,7 +333,14 @@ class CreditIssuer:
             7. If final credit: freeze counts + set event
         """
         gate = getattr(self, "replay_gate", ReplayIssueGate(None))
-        return await gate.submit(turn, lambda: self._issue_credit_ready(turn))
+        lane_gate = getattr(self, "_root_dispatch_gate", None)
+        if lane_gate is None:
+            return await gate.submit(turn, lambda: self._issue_credit_ready(turn))
+        # --agentic-live-sessions > 1: once the recorded-predecessor barrier
+        # clears, a depth-0 turn also waits for its dispatch lane's rotation.
+        return await gate.submit(
+            turn, lambda: lane_gate.submit(turn, lambda: self._issue_credit_ready(turn))
+        )
 
     async def _issue_credit_ready(self, turn: TurnToSend) -> bool:
         """Issue a turn whose recorded predecessor frontier is complete."""
@@ -521,6 +536,9 @@ class CreditIssuer:
         replay_gate = getattr(self, "replay_gate", None)
         if replay_gate is not None:
             await replay_gate.observe_issued(credit)
+        lane_gate = getattr(self, "_root_dispatch_gate", None)
+        if lane_gate is not None:
+            lane_gate.observe_issued(credit)
         if is_final_credit:
             if (
                 self._defer_session_target_completion

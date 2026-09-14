@@ -376,6 +376,20 @@ class BasePhaseConfig(AdaptiveScalePhaseMixin, BaseConfig):
         ),
     ]
 
+    agentic_live_sessions: Annotated[
+        int,
+        Field(
+            default=1,
+            ge=1,
+            description="AGENTIC_REPLAY only: live session trees per concurrency "
+            "lane (wave round-robin). The trajectory set holds concurrency x this "
+            "many trees; each lane rotates its main-agent turns across its trees "
+            "so at most ``concurrency`` main-agent requests are in flight while "
+            "concurrency x K sessions stay live. 1 (default) is the classic one "
+            "tree per lane.",
+        ),
+    ]
+
     agentic_warmup_grace_period: Annotated[
         float | None,
         Field(
