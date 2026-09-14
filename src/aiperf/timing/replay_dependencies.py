@@ -285,7 +285,11 @@ class ReplayBarrierCoordinator:
         ready = [key for key in state.pending if self._ready(state, key)]
         for key in sorted(ready):
             pending = state.pending.pop(key)
-            task = asyncio.create_task(self._dispatch_pending(pending))
+            task = (
+                self._scheduler.execute_async(self._dispatch_pending(pending))
+                if self._scheduler is not None
+                else asyncio.create_task(self._dispatch_pending(pending))
+            )
             self._dispatch_tasks.add(task)
             task.add_done_callback(self._dispatch_tasks.discard)
         if state.in_flight == 0:
@@ -398,6 +402,22 @@ class ReplayBarrierCoordinator:
             if state.pending
         }
 
+    def has_pending_work(self) -> bool:
+        """Whether a retained, dispatching, or wire request can release work.
+
+        Completed-prefix history by itself is inert and therefore excluded.
+        Dispatch tasks are retained until their done callbacks run, closing the
+        small interval between removing a pending entry and reaching the wire.
+        """
+        return any(
+            state.pending or state.in_flight > 0 for state in self._roots.values()
+        ) or any(not task.done() for task in self._dispatch_tasks)
+
+    @property
+    def dispatching_count(self) -> int:
+        """Barrier-release tasks between pending ownership and final disposition."""
+        return sum(not task.done() for task in self._dispatch_tasks)
+
     async def cancel_pending(self, *, notify_refused: bool) -> None:
         """Cancel retained dispatches during phase teardown."""
         callbacks = []
@@ -426,21 +446,23 @@ class ReplayBarrierCoordinator:
 
     @staticmethod
     async def _dispatch_pending(pending: _PendingDispatch) -> None:
+        failure: Exception | None = None
         try:
             issued = await pending.issue()
-        except Exception:
-            # This runs detached in a task whose only done-callback discards it,
-            # so a raise here would be swallowed ("Task exception was never
-            # retrieved") and any parent join waiting on this stream would hang
-            # until the drain timeout. Treat an issue failure as a refusal so
-            # on_refused cleanup runs and the phase can fail fast.
+        except Exception as error:
+            # Settle refusal bookkeeping first, then re-raise into the shared
+            # LoopScheduler exception handler so a vanished failed task cannot
+            # be mistaken for successful quiescence.
             _logger.exception(
                 "Barrier-released replay dispatch failed for %r", pending.turn
             )
+            failure = error
             issued = False
         rejected = issued is False or issued is ChildDispatchResult.REJECTED
         if rejected and pending.on_refused is not None:
             await pending.on_refused()
+        if failure is not None:
+            raise failure
 
 
 class ReplayIssueGate:
@@ -529,6 +551,15 @@ class ReplayIssueGate:
         if self._coordinator is None:
             return {}
         return self._coordinator.pending_turns_by_root()
+
+    def has_pending_work(self) -> bool:
+        """Whether the underlying replay barrier can still issue a request."""
+        return self._coordinator is not None and self._coordinator.has_pending_work()
+
+    @property
+    def dispatching_count(self) -> int:
+        """Barrier-release tasks not yet issued, deferred, or refused."""
+        return self._coordinator.dispatching_count if self._coordinator else 0
 
     async def cancel(self, *, notify_refused: bool) -> None:
         if self._coordinator is not None:

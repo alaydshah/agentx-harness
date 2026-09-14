@@ -131,6 +131,17 @@ class PhaseRunner(TaskManagerMixin):
         self._branch_orchestrator = branch_orchestrator
         self._run = run
         self._session_tree_registry = session_tree_registry
+        # A fixed root-session target is an admission boundary, not a
+        # generation boundary, for Agentic Replay. Its admitted trees may
+        # still own delayed continuations, children, joins, and barrier-held
+        # turns after the last planned root wire is sent. A simultaneous hard
+        # request cap remains an immediate hard stop only when it is actually
+        # reached; merely configuring one must not restore the old session
+        # boundary race.
+        self._defer_session_target_completion = (
+            config.timing_mode == TimingMode.AGENTIC_REPLAY
+            and config.expected_num_sessions is not None
+        )
         self._cache_warmup_enabled = (
             isinstance(
                 getattr(config, "agentic_cache_warmup_duration_sec", None),
@@ -188,7 +199,10 @@ class PhaseRunner(TaskManagerMixin):
         self._on_phase_complete: Callable[[], None] | None = None
 
         # Per-phase components - order matters
-        self._scheduler = LoopScheduler()
+        self._scheduler_failure: BaseException | None = None
+        self._scheduler = LoopScheduler(
+            exception_handler=self._on_scheduler_task_failure
+        )
         self._lifecycle = PhaseLifecycle(self._config)
         self._progress = PhaseProgressTracker(self._config)
         self._stop_checker = StopConditionChecker(
@@ -262,6 +276,7 @@ class PhaseRunner(TaskManagerMixin):
                 or self._cache_warmup_enabled
             ),
             replay_barrier=self._replay_barrier,
+            defer_session_target_completion=self._defer_session_target_completion,
         )
 
     def _maybe_construct_branch_orchestrator(
@@ -365,6 +380,66 @@ class PhaseRunner(TaskManagerMixin):
         """
         self._on_phase_complete = callback
 
+    def _on_scheduler_task_failure(self, task: asyncio.Task) -> None:
+        """Retain the first failed replay task for the generation waiter.
+
+        ``LoopScheduler`` otherwise observes and discards task exceptions.
+        Quiescence must never turn a vanished failed task into a successful
+        phase.
+        """
+        error = task.exception()
+        if error is not None and self._scheduler_failure is None:
+            self._scheduler_failure = error
+
+    def _raise_generation_failure(self) -> None:
+        """Raise any failed scheduler or initial strategy task."""
+        if self._scheduler_failure is not None:
+            raise RuntimeError("scheduled Agentic Replay work failed") from (
+                self._scheduler_failure
+            )
+        task = self._execution_task
+        if task is None or not task.done() or task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            raise RuntimeError("Agentic Replay initial dispatch failed") from error
+
+    def _is_generation_complete(self) -> bool:
+        """Whether root admission is closed and no future request is possible."""
+        counter = self._progress.counter
+        tree_open = (
+            self._session_tree_registry.open_count(self._phase_key)
+            if self._session_tree_registry is not None
+            else 0
+        )
+        tree_reserved = (
+            self._session_tree_registry.pending_descendant_count
+            if self._session_tree_registry is not None
+            else 0
+        )
+        branch_pending = (
+            self._branch_orchestrator.has_pending_branch_work()
+            if self._branch_orchestrator is not None
+            else False
+        )
+        replay_pending = self._credit_issuer.replay_gate.has_pending_work()
+        execution_running = (
+            self._execution_task is not None and not self._execution_task.done()
+        )
+        return (
+            counter.root_admission_closed
+            and counter.root_requests_sent >= counter.total_session_turns
+            and not execution_running
+            and counter.in_flight == 0
+            and tree_open == 0
+            and tree_reserved == 0
+            and self._scheduler.pending_count == 0
+            and self._scheduler.running_count == 0
+            and not branch_pending
+            and not replay_pending
+            and self._scheduler_failure is None
+        )
+
     def _is_phase_complete(self) -> bool:
         """Return True if the request-count cap has been reached AND no DAG
         children are still in flight.
@@ -417,7 +492,8 @@ class PhaseRunner(TaskManagerMixin):
             self._return_wait_task.cancel()
         for ramper in self._rampers:
             ramper.stop()
-        self._scheduler.cancel_all()
+        if not self._scheduler.is_idle():
+            self._scheduler.cancel_all()
 
     def _on_return_wait_complete(self, task: asyncio.Task) -> None:
         """Handle completion of background return wait task (seamless mode).
@@ -940,7 +1016,16 @@ class PhaseRunner(TaskManagerMixin):
         )
 
     async def _wait_for_accelerated_warmup_wire_drain(self) -> None:
-        while self._progress.in_flight > 0:
+        # A barrier release temporarily owns a turn in ``_dispatch_tasks``
+        # after removing it from the pending map but before the issue/admission
+        # path either sends it or records it for handoff. Snapshotting in that
+        # interval loses the turn. Once releases are paused and wire traffic is
+        # zero, waiting for these transition tasks is finite and makes the
+        # handoff snapshot atomic with respect to barrier ownership.
+        while (
+            self._progress.in_flight > 0
+            or self._credit_issuer.replay_gate.dispatching_count > 0
+        ):
             await asyncio.sleep(0.1)
 
     async def _cancel_accelerated_warmup_drain(self, *, timeout: float | None) -> None:
@@ -992,26 +1077,74 @@ class PhaseRunner(TaskManagerMixin):
         )
         self._progress.all_credits_returned_event.set()
 
+    async def _wait_for_generation_drain(self, timeout: float | None) -> bool:
+        """Wait for fixed-session Agentic Replay to reach stable quiescence.
+
+        Returns True on timeout. All ledgers are event-loop-local, and the
+        50 ms completion precision has no bearing on request timestamps.
+        """
+
+        async def wait_until_quiescent() -> None:
+            while not self._is_generation_complete():
+                self._raise_generation_failure()
+                await asyncio.sleep(0.05)
+            self._raise_generation_failure()
+
+        name = f"{self._config.phase} phase generation drain"
+        if timeout is None or math.isinf(timeout):
+            self.info(f"Waiting for '{name}' indefinitely")
+            await wait_until_quiescent()
+            return False
+        if timeout <= 0:
+            self.info(f"Timeout already elapsed for '{name}'")
+            if self._execution_task is not None:
+                self._execution_task.cancel()
+            return True
+        try:
+            self.info(f"Waiting for '{name}' with timeout of {timeout}s")
+            await asyncio.wait_for(wait_until_quiescent(), timeout=timeout)
+            return False
+        except TimeoutError:
+            self.info(f"Timeout of {timeout}s elapsed for '{name}'")
+            if self._execution_task is not None:
+                self._execution_task.cancel()
+            return True
+
     async def _wait_for_sending_complete(
         self, strategy: TimingStrategyProtocol
     ) -> None:
         """Wait for phase to send all credits (with timeout).
 
         Uses lifecycle.time_left_in_seconds() for timeout duration.
-        On timeout or completion, cancels pending scheduled requests,
-        freezes sent counts, and marks sending complete.
+        Fixed-session Agentic Replay distinguishes root-admission closure from
+        generation completion and drains every admitted tree without cancelling
+        scheduled work. Timeout/error paths retain cancellation.
         """
         timed_out = False
+        wait_error: Exception | None = None
         try:
             timeout = self._lifecycle.time_left_in_seconds()
-            timed_out = await self._wait_for_event_with_timeout(
-                name=f"{self._config.phase} phase sending",
-                event=self._progress.all_credits_sent_event,
-                timeout=timeout,
-                task_to_cancel=self._execution_task,
-                set_event_on_timeout=True,
-            )
+            if self._defer_session_target_completion:
+                timed_out = await self._wait_for_generation_drain(timeout)
+                if timed_out:
+                    wait_error = TimeoutError(
+                        "fixed-session Agentic Replay generation drain exceeded "
+                        f"the {self._config.phase.title} safety ceiling"
+                    )
+                else:
+                    self._credit_issuer.stop_issuing()
+                    self._progress.all_credits_sent_event.set()
+            else:
+                timed_out = await self._wait_for_event_with_timeout(
+                    name=f"{self._config.phase} phase sending",
+                    event=self._progress.all_credits_sent_event,
+                    timeout=timeout,
+                    task_to_cancel=self._execution_task,
+                    set_event_on_timeout=True,
+                )
         except Exception as e:
+            timed_out = True
+            wait_error = e
             self.error(
                 f"Error waiting for phase {self._config.phase} to send all credits: {e!r}"
             )
@@ -1019,18 +1152,24 @@ class PhaseRunner(TaskManagerMixin):
             preserve_branch_handoff = self._preserve_replay_gate_until_finalize(
                 strategy
             )
+            drained_normally = (
+                self._defer_session_target_completion
+                and not timed_out
+                and self._is_generation_complete()
+            )
             if not self._lifecycle.is_sending_complete:
                 self._lifecycle.mark_sending_complete(timeout_triggered=timed_out)
                 self._progress.freeze_sent_counts()
-                self._scheduler.cancel_all_pending()
-                if (
-                    self._branch_orchestrator is not None
-                    and not preserve_branch_handoff
-                ):
-                    await self._branch_orchestrator.expire_replay_deadlines()
+                if not drained_normally:
+                    self._scheduler.cancel_all_pending()
+                    if (
+                        self._branch_orchestrator is not None
+                        and not preserve_branch_handoff
+                    ):
+                        await self._branch_orchestrator.expire_replay_deadlines()
                 self._progress.all_credits_sent_event.set()
 
-            if not preserve_branch_handoff:
+            if not preserve_branch_handoff and not drained_normally:
                 await self._credit_issuer.replay_gate.cancel(
                     notify_refused=self._config.phase == CreditPhase.PROFILING
                 )
@@ -1039,6 +1178,10 @@ class PhaseRunner(TaskManagerMixin):
             self.notice(self._format_phase_sending_complete(stats))
             await self._phase_publisher.publish_progress(stats)
             await self._phase_publisher.publish_phase_sending_complete(stats)
+        if wait_error is not None:
+            raise RuntimeError(
+                f"phase {self._config.phase} generation failed"
+            ) from wait_error
 
     async def _wait_for_returning_complete(
         self,

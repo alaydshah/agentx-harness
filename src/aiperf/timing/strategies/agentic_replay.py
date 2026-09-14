@@ -191,9 +191,17 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             else None
         )
         self._cache_warmup_requests_by_lane: Counter[int] = Counter()
+        self._cache_warmup_selected_by_lane: dict[
+            int, set[tuple[str, str, int]]
+        ] = {}
+        self._cache_warmup_admitted_by_lane: dict[
+            int, set[tuple[str, str, int]]
+        ] = {}
         self._cache_warmup_request_budget_reached = False
         self._baseline_warmup_admitted = 0
-        self._quota_handoff_turns: dict[tuple[str, str, int], TurnToSend] = {}
+        self._quota_handoff_turns: dict[
+            tuple[str, str, str, int], TurnToSend
+        ] = {}
         self._baseline_warmup_returns: dict[str, Credit] = {}
         self._baseline_correlations: set[str] = set()
         self._baseline_warmup_turns: set[tuple[str, int]] = set()
@@ -454,6 +462,89 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             )
         return lane
 
+    def _extend_cache_warmup_selection(
+        self,
+        lane: int,
+        *,
+        root_correlation_id: str,
+        root_conversation_id: str,
+        boundaries: tuple[ReplayResumeBoundary, ...] = (),
+    ) -> None:
+        """Preselect the next recorded turns that consume one lane's quota.
+
+        Ready streams can race at the quota boundary, so counting whichever
+        admission callback runs first makes endpoint latency change which
+        request falls into WARMUP versus PROFILING. Select by the dataset's
+        flattened timestamp order instead. When a short tree drains before the
+        quota is full, the recycle path extends the same lane selection from
+        the newly assigned root.
+        """
+        quota = self._cache_warmup_requests_per_lane
+        if quota is None:
+            return
+        selected = self._cache_warmup_selected_by_lane.setdefault(lane, set())
+        remaining = quota - len(selected)
+        if remaining <= 0:
+            return
+        completed = {
+            boundary.conversation_id: boundary.next_turn_index
+            for boundary in boundaries
+        }
+        conversation_ids = self.conversation_source._collect_trace_conversation_ids(
+            root_conversation_id
+        )
+        candidates: list[tuple[tuple[bool, float, str, int], tuple[str, str, int]]] = []
+        for conversation_id in conversation_ids:
+            metadata = self.conversation_source._metadata_lookup.get(conversation_id)
+            if metadata is None:
+                continue
+            start = completed.get(conversation_id, 0)
+            for turn_index in range(start, len(metadata.turns)):
+                turn = metadata.turns[turn_index]
+                timestamp_ms = _as_timestamp_ms(
+                    getattr(turn, "timestamp_ms", None)
+                )
+                candidates.append(
+                    (
+                        (
+                            timestamp_ms is None,
+                            timestamp_ms or 0.0,
+                            conversation_id,
+                            turn_index,
+                        ),
+                        (root_correlation_id, conversation_id, turn_index),
+                    )
+                )
+        for _, key in sorted(candidates)[:remaining]:
+            selected.add(key)
+
+    def _initialize_cache_warmup_selection(self) -> None:
+        if self._cache_warmup_requests_per_lane is None:
+            return
+        for lane, trajectory in enumerate(self.conversation_source.trajectories):
+            if trajectory.snapshot is None:
+                self._extend_cache_warmup_selection(
+                    lane,
+                    root_correlation_id=trajectory.x_correlation_id,
+                    root_conversation_id=trajectory.conversation_id,
+                    boundaries=(
+                        ReplayResumeBoundary(
+                            trajectory.conversation_id,
+                            trajectory.start_turn_index + 1,
+                        ),
+                    ),
+                )
+                continue
+            root_correlation_id = self._lane_root_corr(trajectory.snapshot)
+            if root_correlation_id is None:
+                continue
+            self._extend_cache_warmup_selection(
+                lane,
+                root_correlation_id=root_correlation_id,
+                root_conversation_id=trajectory.conversation_id,
+                boundaries=trajectory.snapshot.replay_resume_boundaries,
+            )
+
     def _admit_cache_warmup_turn(self, turn: TurnToSend) -> TurnAdmission:
         """Admit mandatory primers, then enforce the additional per-lane quota.
 
@@ -472,17 +563,39 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         if is_baseline:
             self._baseline_warmup_admitted += 1
             return TurnAdmission.ADMIT
-        if (
-            self._cache_warmup_requests_by_lane[lane]
-            >= self._cache_warmup_requests_per_lane
-        ):
-            state_key = (
-                turn.conversation_id,
-                turn.x_correlation_id,
-                turn.turn_index,
-            )
+        state_key = (
+            turn.effective_root_correlation_id,
+            turn.conversation_id,
+            turn.x_correlation_id,
+            turn.turn_index,
+        )
+        if not self._accelerated_warmup_started:
+            if (
+                self._cache_warmup_requests_by_lane[lane]
+                >= self._cache_warmup_requests_per_lane
+            ):
+                self._quota_handoff_turns[state_key] = turn
+                return TurnAdmission.DEFER
+            self._record_cache_warmup_admission(lane)
+            return TurnAdmission.ADMIT
+        selection_key = (
+            turn.effective_root_correlation_id,
+            turn.conversation_id,
+            turn.turn_index,
+        )
+        selected = self._cache_warmup_selected_by_lane.setdefault(lane, set())
+        admitted = self._cache_warmup_admitted_by_lane.setdefault(lane, set())
+        if selection_key not in selected:
             self._quota_handoff_turns[state_key] = turn
             return TurnAdmission.DEFER
+        if selection_key not in admitted:
+            admitted.add(selection_key)
+            self._record_cache_warmup_admission(lane)
+        return TurnAdmission.ADMIT
+
+    def _record_cache_warmup_admission(self, lane: int) -> None:
+        """Count one additional warmup turn and close the global quota once."""
+        assert self._cache_warmup_requests_per_lane is not None
         self._cache_warmup_requests_by_lane[lane] += 1
         if not self._cache_warmup_request_budget_reached and all(
             self._cache_warmup_requests_by_lane[lane_index]
@@ -498,7 +611,6 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 f"{len(self.conversation_source.trajectories)} lanes; "
                 "draining requests"
             )
-        return TurnAdmission.ADMIT
 
     async def execute_phase(self) -> None:
         """Dispatch initial credits for the phase."""
@@ -789,6 +901,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 continue
             self._handoff_credits[credit.x_correlation_id] = credit
         self._accelerated_warmup_started = True
+        self._initialize_cache_warmup_selection()
         self.credit_issuer.set_max_tokens_override(_WARMUP_MAX_TOKENS)
         for trajectory in self.conversation_source.trajectories:
             self._seed_trajectory_replay_prefix(trajectory)
@@ -947,6 +1060,43 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             and not self.allows_pending_branch_handoff_after_sending_complete
         ):
             await self.branch_orchestrator.on_child_stopped(turn.x_correlation_id)
+
+    async def _issue_required_snapshot_turn(self, turn: TurnToSend) -> None:
+        """Issue a snapshot-planned descendant or fail the phase closed.
+
+        Snapshot states count toward the realized profiling plan, unlike
+        reactive children spawned after a parent return. Keep the ordinary
+        ``issue_credit`` path (and its target-membership bit), but no longer
+        discard a refusal.
+        """
+        more = await self.credit_issuer.issue_credit(turn)
+        if more is not False:
+            return
+        if self.branch_orchestrator is not None:
+            await self.branch_orchestrator.on_child_stopped(
+                turn.x_correlation_id
+            )
+        raise RuntimeError(
+            "required Agentic Replay snapshot descendant was refused: "
+            f"conversation={turn.conversation_id!r} "
+            f"root={turn.effective_root_correlation_id!r}"
+        )
+
+    async def _issue_required_root_turn(self, turn: TurnToSend) -> None:
+        """Issue an initial fixed-session root or fail the phase closed.
+
+        In the quiescent fixed-session path a session-target credit returns
+        True after issuance, so False means the root never reached the wire.
+        Descendants must not continue under an unadmitted root.
+        """
+        more = await self.credit_issuer.issue_credit(turn)
+        sessions = getattr(self.config, "expected_num_sessions", None)
+        if isinstance(sessions, int) and sessions > 0 and more is False:
+            raise RuntimeError(
+                "required Agentic Replay root was refused: "
+                f"conversation={turn.conversation_id!r} "
+                f"root={turn.effective_root_correlation_id!r}"
+            )
 
     async def finalize_phase(self) -> None:
         """Persist the drained accelerated-warmup DAG for profiling."""
@@ -1433,7 +1583,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             return
 
         turn = self._build_turn_for_session(session, resume_index)
-        await self.credit_issuer.issue_credit(turn)
+        await self._issue_required_root_turn(turn)
 
     async def handle_credit_return(
         self, credit: Credit, *, error: str | None = None
@@ -1635,12 +1785,17 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 self._replay_origin_ms_by_root[
                     session.effective_root_correlation_id
                 ] = first_timestamp_ms
+            self._extend_cache_warmup_selection(
+                lane,
+                root_correlation_id=session.effective_root_correlation_id,
+                root_conversation_id=next_trace_id,
+            )
         self._mint_marker_for_session(
             session.effective_root_correlation_id, next_trace_id, lane
         )
 
         turn = self._build_turn_for_session(session, 0)
-        await self.credit_issuer.issue_credit(turn)
+        await self._issue_required_root_turn(turn)
 
     async def _on_rootless_child_done(self, lane: int) -> None:
         """Account a rootless lane's background child completing.
@@ -1776,11 +1931,16 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                         0,
                         len(gated_session.metadata.turns) - gated_state.next_turn_index,
                     )
-            await self.credit_issuer.acquire_lane_credit(
+            acquired = await self.credit_issuer.acquire_lane_credit(
                 lane_root_corr,
                 root_pending=has_root_state,
                 session_turns=gated_session_turns,
             )
+            if not acquired:
+                raise RuntimeError(
+                    "Agentic Replay snapshot lane was not admitted: "
+                    f"lane={lane} root={lane_root_corr!r}"
+                )
             if not self._has_tree_registry and not has_root_state:
                 self._rootless_lane_outstanding[lane] = len(dispatchable)
         # Spread (default): every lane shares one phase-wide T0, preserving
@@ -1790,17 +1950,22 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             turn = self._build_turn_for_session(session, state.next_turn_index)
             if state.agent_depth == 0:
                 turn = _struct_replace(turn, is_session_start=True)
+            coro = (
+                self._issue_required_snapshot_turn(turn)
+                if turn.agent_depth > 0
+                else self._issue_required_root_turn(turn)
+            )
             delay_s = (
                 offset_by_corr[state.x_correlation_id] - t0_offset_ms
             ) / MILLIS_PER_SECOND
             if delay_s > 0:
                 self.scheduler.schedule_later(
                     delay_s,
-                    self.credit_issuer.issue_credit(turn),
+                    coro,
                     group_id=turn.effective_root_correlation_id,
                 )
             else:
-                await self.credit_issuer.issue_credit(turn)
+                await coro
 
         root_correlation_id = self._lane_root_corr(snapshot)
         if root_correlation_id is not None:

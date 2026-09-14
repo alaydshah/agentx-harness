@@ -1289,17 +1289,32 @@ class BranchOrchestrator:
         refusal. Dispatch and settlement run under the parent lock, matching
         the intercept path's locking.
         """
-        await self._sleep_offset_ms(offset_ms)
+        try:
+            await self._sleep_offset_ms(offset_ms)
+        except asyncio.CancelledError:
+            if not self._cleaning_up:
+                async with self._parent_locks[parent_corr]:
+                    self._rollback_failed_first_turn(
+                        child, ChildDispatchResult.REJECTED, parent_corr
+                    )
+                    await self._finalize_failed_dispatches(parent_corr)
+            raise
         if self._cleaning_up:
             return
         async with self._parent_locks[parent_corr]:
             try:
                 result = await self._dispatch_first_turn(child)
+            except asyncio.CancelledError:
+                self._rollback_failed_first_turn(
+                    child, ChildDispatchResult.REJECTED, parent_corr
+                )
+                await self._finalize_failed_dispatches(parent_corr)
+                raise
             except Exception as exc:
-                result = exc
-            if isinstance(result, BaseException) or (
-                ChildDispatchResult.normalize(result) is ChildDispatchResult.REJECTED
-            ):
+                self._rollback_failed_first_turn(child, exc, parent_corr)
+                await self._finalize_failed_dispatches(parent_corr)
+                raise
+            if ChildDispatchResult.normalize(result) is ChildDispatchResult.REJECTED:
                 self._rollback_failed_first_turn(child, result, parent_corr)
                 await self._finalize_failed_dispatches(parent_corr)
 
@@ -1751,6 +1766,8 @@ class BranchOrchestrator:
 
     def has_pending_branch_work(self) -> bool:
         """Return True if any DAG-dispatched children are still outstanding."""
+        if any(not task.done() for task in self._delayed_dispatch_tasks):
+            return True
         if self._active_joins:
             return True
         if any(gates for gates in self._future_joins.values()):

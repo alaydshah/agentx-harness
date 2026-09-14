@@ -156,6 +156,17 @@ class SessionTreeRegistry:
         """Count of returns for already-released trees (premature-drain evidence)."""
         return self._late_events
 
+    @property
+    def pending_descendant_count(self) -> int:
+        """Descendants reserved before their tree acquires its session slot.
+
+        This is generation work, even though it is not yet represented in
+        :meth:`open_count`. Completion gates must include it or a snapshot
+        child can create a transient false-idle interval between reservation
+        and ``open_tree``.
+        """
+        return sum(self._pending_descendants.values())
+
     def has_tree(self, root_corr: str) -> bool:
         """True when this registry is tracking ``root_corr`` (engagement gate)."""
         return root_corr in self._trees

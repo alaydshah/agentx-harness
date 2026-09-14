@@ -124,6 +124,22 @@ class CreditCounter:
         """Requests sent but prefill not yet complete (TTFT not received)."""
         return self._requests_sent - self._prefills_released
 
+    @property
+    def request_cap_reached(self) -> bool:
+        """Whether the hard wire-request cap has been reached."""
+        return (
+            self._config.total_expected_requests is not None
+            and self._requests_sent >= self._config.total_expected_requests
+        )
+
+    @property
+    def root_admission_closed(self) -> bool:
+        """Whether the configured root-session quota rejects new roots."""
+        return (
+            self._config.expected_num_sessions is not None
+            and self._sent_sessions >= self._config.expected_num_sessions
+        )
+
     # =========================================================================
     # Final count properties (frozen values)
     # =========================================================================
