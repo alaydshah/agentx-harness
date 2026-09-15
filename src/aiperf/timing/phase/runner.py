@@ -407,6 +407,17 @@ class PhaseRunner(TaskManagerMixin):
     def _is_generation_complete(self) -> bool:
         """Whether root admission is closed and no future request is possible."""
         counter = self._progress.counter
+        drain_target = getattr(self._config, "agentic_drain_target_requests", None)
+        # Drain-target mode freezes its complete trajectory set before dispatch
+        # and forbids recycle outside that set. A selected trajectory can become
+        # rootless during cache-pressure warmup, so it legitimately contributes
+        # no root session to ``sent_sessions`` and ``root_admission_closed`` can
+        # remain false forever. In this mode the frozen plan itself closes root
+        # admission; the quiescence checks below still prove that every selected
+        # root, descendant, timer, and replay dependency has drained.
+        root_admission_closed = counter.root_admission_closed or (
+            isinstance(drain_target, int) and drain_target > 0
+        )
         tree_open = (
             self._session_tree_registry.open_count(self._phase_key)
             if self._session_tree_registry is not None
@@ -427,7 +438,7 @@ class PhaseRunner(TaskManagerMixin):
             self._execution_task is not None and not self._execution_task.done()
         )
         return (
-            counter.root_admission_closed
+            root_admission_closed
             and counter.root_requests_sent >= counter.total_session_turns
             and not execution_running
             and counter.in_flight == 0
