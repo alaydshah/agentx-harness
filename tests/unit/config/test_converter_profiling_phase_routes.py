@@ -691,3 +691,19 @@ class TestRateSeries:
 
         with pytest.raises(ValueError, match="user-centric-rate"):
             build_profiling(user)
+
+
+def test_agentic_drain_target_routes_to_profiling_phase() -> None:
+    user = _make_user(
+        loadgen=CLIConfig(
+            concurrency=3,
+            benchmark_duration=120,
+            agentic_live_sessions=4,
+            agentic_drain_target_requests=1000,
+        ),
+        input_cfg=CLIConfig(conversation_num=12),
+    )
+    profiling = build_profiling(user)
+    assert profiling["agentic_drain_target_requests"] == 1000
+    assert profiling["agentic_live_sessions"] == 4
+    assert profiling["sessions"] == 12

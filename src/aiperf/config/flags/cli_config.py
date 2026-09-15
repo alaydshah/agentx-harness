@@ -2169,6 +2169,25 @@ class CLIConfig(BaseConfig):
         ),
     ] = 1
 
+    agentic_drain_target_requests: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="AGENTIC_REPLAY only: deterministically choose the complete "
+            "trace trees for the configured live session slots so their estimated "
+            "profiling request count is greedily as close as possible to this "
+            "target. Selection is frozen before warmup and recorded in the output "
+            "artifacts. Requires --num-conversations to equal "
+            "--concurrency * --agentic-live-sessions and both trajectory start "
+            "ratios to be zero.",
+        ),
+        CLIParameter(
+            name=("--agentic-drain-target-requests",),
+            group=Groups.LOAD_GENERATOR,
+        ),
+    ] = None
+
     burst_phase_starts: Annotated[
         bool,
         Field(

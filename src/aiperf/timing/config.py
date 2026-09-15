@@ -140,6 +140,12 @@ class TimingConfig(AIPerfBaseModel):
         "(``--agentic-live-sessions``). TrajectorySource builds concurrency x "
         "this many trees; 1 is the classic one tree per lane.",
     )
+    agentic_warmup_requests_per_lane: int | None = Field(
+        default=None,
+        gt=0,
+        description="AGENTIC_REPLAY cache-pressure warmup requests per live tree, "
+        "retained for pre-dispatch profiling-work estimation.",
+    )
     allow_dataset_wrap: bool = Field(
         default=False,
         description="Allow AGENTIC_REPLAY to reuse distinct eligible traces "
@@ -208,6 +214,9 @@ class TimingConfig(AIPerfBaseModel):
         trajectory_min = getattr(first_profiling, "trajectory_start_min_ratio", 0.25)
         trajectory_max = getattr(first_profiling, "trajectory_start_max_ratio", 0.75)
         live_sessions = getattr(first_profiling, "agentic_live_sessions", 1) or 1
+        warmup_requests_per_lane = getattr(
+            first_profiling, "warmup_requests_per_lane", None
+        )
         synthesis = getattr(cfg.get_default_dataset(), "synthesis", None)
         allow_dataset_wrap = bool(
             getattr(synthesis, "allow_dataset_wrap", False) if synthesis else False
@@ -224,6 +233,7 @@ class TimingConfig(AIPerfBaseModel):
             trajectory_start_min_ratio=trajectory_min,
             trajectory_start_max_ratio=trajectory_max,
             agentic_live_sessions=live_sessions,
+            agentic_warmup_requests_per_lane=warmup_requests_per_lane,
             allow_dataset_wrap=allow_dataset_wrap,
             cache_bust_enabled=cache_bust_enabled,
         )
@@ -383,6 +393,12 @@ class CreditPhaseConfig(AIPerfBaseModel):
         "counts every tree (user concurrency x this value); the PROFILING "
         "strategy bounds main-agent requests in flight to user concurrency "
         "via ``LaneRotationGate``. 1 is the classic one tree per lane.",
+    )
+    agentic_drain_target_requests: int | None = Field(
+        default=None,
+        gt=0,
+        description="Target profiling request count used to select a deterministic "
+        "fixed set of complete agentic trace trees before warmup.",
     )
 
     artifact_dir: Path | None = Field(
@@ -733,6 +749,9 @@ def _build_profiling_config(
         expected_num_sessions=phase.sessions,
         concurrency=_session_slot_concurrency(phase),
         agentic_live_sessions=_agentic_live_sessions(phase),
+        agentic_drain_target_requests=getattr(
+            phase, "agentic_drain_target_requests", None
+        ),
         prefill_concurrency=phase.prefill_concurrency,
         request_rate=_phase_request_rate(phase),
         arrival_pattern=_phase_arrival_pattern(phase),

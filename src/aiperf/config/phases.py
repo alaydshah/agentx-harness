@@ -390,6 +390,17 @@ class BasePhaseConfig(AdaptiveScalePhaseMixin, BaseConfig):
         ),
     ]
 
+    agentic_drain_target_requests: Annotated[
+        int | None,
+        Field(
+            default=None,
+            gt=0,
+            description="AGENTIC_REPLAY only: target profiling request count for "
+            "deterministic, complete-tree selection. The selected live trace set "
+            "is frozen before warmup and may land above or below the target.",
+        ),
+    ]
+
     agentic_warmup_grace_period: Annotated[
         float | None,
         Field(

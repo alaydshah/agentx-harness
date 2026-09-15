@@ -17,9 +17,11 @@ aiperf's existing ``User`` class in ``user_centric_rate.py``.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -36,6 +38,7 @@ from aiperf.timing.conversation_source import ConversationSource, SampledSession
 from aiperf.timing.replay_dependencies import ReplayResumeBoundary
 
 _logger = AIPerfLogger(__name__)
+_DRAIN_SELECTION_ALGORITHM = "canonical-seeded-progressive-greedy-v1"
 
 
 @dataclass(slots=True, frozen=True)
@@ -244,6 +247,9 @@ class TrajectorySource(ConversationSource):
         expected_duration_sec: float | None = None,
         cache_bust_enabled: bool = False,
         live_sessions_per_lane: int = 1,
+        drain_target_requests: int | None = None,
+        warmup_requests_per_lane: int | None = None,
+        selection_artifact_dir: Path | None = None,
     ) -> None:
         super().__init__(
             dataset_metadata=dataset_metadata, dataset_sampler=dataset_sampler
@@ -263,6 +269,14 @@ class TrajectorySource(ConversationSource):
             raise ValueError(
                 f"start_min_ratio ({start_min_ratio}) must be <= "
                 f"start_max_ratio ({start_max_ratio})."
+            )
+        if drain_target_requests is not None and (
+            start_min_ratio != 0 or start_max_ratio != 0
+        ):
+            raise ValueError(
+                "--agentic-drain-target-requests requires turn-zero trajectories "
+                "(--trajectory-start-min-ratio 0 and "
+                "--trajectory-start-max-ratio 0)"
             )
 
         self._random_seed = random_seed
@@ -287,6 +301,10 @@ class TrajectorySource(ConversationSource):
         self._pool_size = pool_size
         self._allow_dataset_wrap = allow_dataset_wrap
         self._children_by_parent: dict[str, set[str]] = self._build_child_index()
+        self._drain_target_requests = drain_target_requests
+        self._warmup_requests_per_lane = warmup_requests_per_lane
+        self._selection_artifact_dir = selection_artifact_dir
+        self._drain_selection_manifest: dict[str, object] | None = None
         self._warned_live_delta_snapshot = False
         # One trajectory per concurrency lane, sampled straight from the dataset
         # sampler (which wraps -- sequential round-robin / shuffle / random --
@@ -302,7 +320,11 @@ class TrajectorySource(ConversationSource):
         # (``LaneRotationGate``). K == 1 is exactly the classic one-per-lane
         # list -- same sampler draws, same per-index t* seeds.
         self._target_size = concurrency * live_sessions_per_lane
-        self.trajectories: list[Trajectory] = self._build_trajectories()
+        self.trajectories: list[Trajectory] = (
+            self._build_targeted_trajectories(expected_num_sessions)
+            if drain_target_requests is not None
+            else self._build_trajectories()
+        )
 
         if not self.trajectories:
             raise EmptyTracePoolError(
@@ -349,6 +371,11 @@ class TrajectorySource(ConversationSource):
             ledger = CacheBustLedger()
             self._cache_bust_ledger = ledger
         return ledger
+
+    @property
+    def drain_selection_manifest(self) -> dict[str, object] | None:
+        """Frozen pre-dispatch drain selection, when target mode is enabled."""
+        return self._drain_selection_manifest
 
     def _log_trajectory_summary(self) -> None:
         """Log a table of every trajectory's start position, one record per line.
@@ -500,6 +527,154 @@ class TrajectorySource(ConversationSource):
             if trajectory is not None:
                 trajectories.append(trajectory)
         return trajectories
+
+    def _build_targeted_trajectories(
+        self, expected_num_sessions: int | None
+    ) -> list[Trajectory]:
+        """Choose the fixed live trace set nearest the profiling request target.
+
+        The configured live set has a fixed cardinality
+        (``concurrency * live_sessions_per_lane``). For slot ``i``, choose the
+        remaining spawnable tree that moves the cumulative request count
+        closest to ``target * (i + 1) / tree_count``. This progressive target
+        keeps both tree sizes and dispatch-lane totals balanced instead of
+        selecting one giant tree merely because it makes the final scalar sum
+        exact. Canonical seed-keyed ordering resolves ties. Runtime timing and
+        completion order never participate.
+        """
+        if expected_num_sessions != self._target_size:
+            raise ValueError(
+                "--agentic-drain-target-requests requires --num-conversations "
+                "to equal --concurrency * --agentic-live-sessions "
+                f"({self._target_size}); got {expected_num_sessions!r}"
+            )
+
+        root_ids = sorted(
+            conversation.conversation_id
+            for conversation in self.dataset_metadata.conversations
+            if getattr(conversation, "is_root", True) is not False
+        )
+        ordered_ids = sorted(
+            root_ids,
+            key=lambda conversation_id: (
+                hashlib.sha256(
+                    f"{_DRAIN_SELECTION_ALGORITHM}:{self._random_seed}:"
+                    f"{conversation_id}".encode()
+                ).digest(),
+                conversation_id,
+            ),
+        )
+
+        target = self._drain_target_requests
+        assert target is not None
+        selected: list[Trajectory] = []
+        counts: list[int] = []
+        total = 0
+        remaining = list(ordered_ids)
+        for lane in range(self._target_size):
+            progressive_target = target * (lane + 1) / self._target_size
+            candidates: list[tuple[float, int, int, Trajectory]] = []
+            for rank, conversation_id in enumerate(remaining):
+                trajectory = self._build_trajectory_for_lane(conversation_id, lane)
+                if trajectory is None:
+                    continue
+                count = self._profiling_request_count(trajectory)
+                if count <= 0:
+                    continue
+                candidates.append(
+                    (
+                        abs(progressive_target - (total + count)),
+                        rank,
+                        count,
+                        trajectory,
+                    )
+                )
+            if not candidates:
+                raise EmptyTracePoolError(
+                    "Drain-target selection could build only "
+                    f"{len(selected)} of {self._target_size} required trace trees."
+                )
+            _, rank, count, trajectory = min(
+                candidates, key=lambda candidate: candidate[:2]
+            )
+            remaining.pop(rank)
+            selected.append(trajectory)
+            counts.append(count)
+            total += count
+
+        self._record_drain_selection(selected, counts)
+        return selected
+
+    def _profiling_request_count(self, trajectory: Trajectory) -> int:
+        """Estimate profiling requests in one complete selected trace tree."""
+        completed: dict[str, int] = {}
+        if trajectory.snapshot is None:
+            completed[trajectory.conversation_id] = trajectory.start_turn_index + 1
+        else:
+            completed = {
+                boundary.conversation_id: boundary.next_turn_index
+                for boundary in trajectory.snapshot.replay_resume_boundaries
+            }
+
+        remaining = sum(
+            max(
+                0,
+                len(self._metadata_lookup[conversation_id].turns)
+                - completed.get(conversation_id, 0),
+            )
+            for conversation_id in self._collect_trace_conversation_ids(
+                trajectory.conversation_id
+            )
+            if conversation_id in self._metadata_lookup
+        )
+        warmup = self._warmup_requests_per_lane or 0
+        return max(0, remaining - warmup)
+
+    def _record_drain_selection(
+        self, trajectories: list[Trajectory], counts: list[int]
+    ) -> None:
+        target = self._drain_target_requests
+        assert target is not None
+        trace_ids = [trajectory.conversation_id for trajectory in trajectories]
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "selection_algorithm": _DRAIN_SELECTION_ALGORITHM,
+            "random_seed": self._random_seed,
+            "target_requests": target,
+            "actual_requests": sum(counts),
+            "actual_requests_semantics": (
+                "planned profiling requests before dispatch; compare the final "
+                "request_count metric for observed completions"
+            ),
+            "target_error_requests": abs(target - sum(counts)),
+            "selected_trace_ids": trace_ids,
+            "selected_trace_profiling_requests": counts,
+        }
+        selection_sha256 = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self._drain_selection_manifest = {
+            **payload,
+            "selection_sha256": selection_sha256,
+        }
+
+        if self._selection_artifact_dir is not None:
+            self._selection_artifact_dir.mkdir(parents=True, exist_ok=True)
+            output = self._selection_artifact_dir / "agentic_drain_selection.json"
+            temporary = output.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(self._drain_selection_manifest, indent=2, sort_keys=True)
+                + "\n"
+            )
+            temporary.replace(output)
+
+        _logger.info(
+            "Agentic drain selection: target=%d actual=%d traces=%d sha256=%s",
+            target,
+            sum(counts),
+            len(trace_ids),
+            selection_sha256,
+        )
 
     def _build_trajectory_for_lane(self, cid: str, lane: int) -> Trajectory | None:
         """Build one lane's trajectory for trace ``cid``, or None if unspawnable.
@@ -918,6 +1093,10 @@ class TrajectorySource(ConversationSource):
         zero turns), bounded to one full pass over the root pool so an
         all-unspawnable pool returns ``None`` rather than spinning.
         """
+        if getattr(self, "_drain_target_requests", None) is not None:
+            # Target mode freezes the complete trace set before warmup. Never
+            # admit an unselected root because a lane drained unexpectedly.
+            return None
         for _ in range(max(1, self._pool_size)):
             cid = self._dataset_sampler.next_conversation_id()
             meta = self._metadata_lookup.get(cid)

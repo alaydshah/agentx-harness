@@ -70,6 +70,18 @@ def test_k4_warmup_request_budget_applies_per_tree() -> None:
     assert warmup.total_expected_requests == 120
 
 
+def test_drain_target_reaches_profiling_config() -> None:
+    phase = _phase(
+        agentic_live_sessions=4,
+        agentic_drain_target_requests=1000,
+        sessions=12,
+        trajectory_start_min_ratio=0,
+        trajectory_start_max_ratio=0,
+    )
+    profiling = _profiling(phase)
+    assert profiling.agentic_drain_target_requests == 1000
+
+
 def test_non_agentic_phase_ignores_default_k() -> None:
     phase = _PHASE_ADAPTER.validate_python(
         {"name": "profiling", "type": "concurrency", "concurrency": 5, "requests": 10}
@@ -92,3 +104,61 @@ def test_aiperf_config_accepts_k_above_one_with_agentic_replay() -> None:
 def test_aiperf_config_accepts_default_k_anywhere() -> None:
     cfg = _make(phases=_agentic_phase())
     assert cfg.benchmark.phases[0].agentic_live_sessions == 1
+
+
+def test_aiperf_config_rejects_drain_target_without_agentic_replay() -> None:
+    with pytest.raises(ValueError, match="agentic-drain-target-requests requires"):
+        _make(phases=_agentic_phase(agentic_drain_target_requests=1000))
+
+
+def test_aiperf_config_accepts_drain_target_with_agentic_replay() -> None:
+    cfg = _make(
+        phases=_agentic_phase(
+            agentic_drain_target_requests=1000,
+            timing_mode="agentic_replay",
+            requests=None,
+            sessions=1,
+            trajectory_start_min_ratio=0,
+            trajectory_start_max_ratio=0,
+        )
+    )
+    assert cfg.benchmark.phases[0].agentic_drain_target_requests == 1000
+
+
+def test_aiperf_config_accepts_drain_target_with_agentic_scenario() -> None:
+    cfg = _make(
+        scenario="inferencex-agentx-mvp",
+        phases=_agentic_phase(
+            agentic_drain_target_requests=1000,
+            requests=None,
+            sessions=1,
+            trajectory_start_min_ratio=0,
+            trajectory_start_max_ratio=0,
+        ),
+    )
+    assert cfg.benchmark.phases[0].agentic_drain_target_requests == 1000
+
+
+def test_aiperf_config_rejects_drain_target_that_can_truncate_trees() -> None:
+    with pytest.raises(ValueError, match="cannot be combined with --request-count"):
+        _make(
+            phases=_agentic_phase(
+                agentic_drain_target_requests=1000,
+                timing_mode="agentic_replay",
+                sessions=1,
+            )
+        )
+
+
+def test_aiperf_config_rejects_drain_target_with_nonzero_start() -> None:
+    with pytest.raises(ValueError, match="requires turn-zero trajectories"):
+        _make(
+            phases=_agentic_phase(
+                agentic_drain_target_requests=1000,
+                timing_mode="agentic_replay",
+                requests=None,
+                sessions=1,
+                trajectory_start_min_ratio=0,
+                trajectory_start_max_ratio=0.5,
+            )
+        )

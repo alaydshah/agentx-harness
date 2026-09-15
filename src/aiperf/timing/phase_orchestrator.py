@@ -178,6 +178,15 @@ class PhaseOrchestrator(AIPerfLifecycleMixin):
                 expected_duration_sec=(
                     profiling.expected_duration_sec if profiling is not None else None
                 ),
+                drain_target_requests=(
+                    profiling.agentic_drain_target_requests
+                    if profiling is not None
+                    else None
+                ),
+                warmup_requests_per_lane=config.agentic_warmup_requests_per_lane,
+                selection_artifact_dir=(
+                    profiling.artifact_dir if profiling is not None else None
+                ),
             )
         else:
             self._conversation_source = ConversationSource(

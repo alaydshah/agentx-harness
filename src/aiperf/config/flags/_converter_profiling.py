@@ -57,6 +57,7 @@ _AGENTIC_REPLAY_ROUTES: tuple[str, ...] = (
     "warmup_requests_per_lane",
     "agentic_warmup_grace_period",
     "agentic_live_sessions",
+    "agentic_drain_target_requests",
 )
 
 

@@ -644,6 +644,72 @@ class BenchmarkConfig(BaseConfig, BenchmarkHelpersMixin):
         return self
 
     @model_validator(mode="after")
+    def validate_agentic_drain_target(self) -> Self:
+        """Reject drain-target selection outside agentic replay."""
+        from aiperf.plugin.enums import TimingMode
+        from aiperf.timing.config import _is_agentic_replay
+
+        profiling_phases = self.get_profiling_phases()
+        if all(
+            getattr(phase, "agentic_drain_target_requests", None) is None
+            for phase in profiling_phases
+        ):
+            return self
+
+        if self.scenario is not None:
+            from aiperf.common.scenario.registry import get_scenario
+
+            scenario_timing_mode = get_scenario(self.scenario).timing_mode
+            if scenario_timing_mode != TimingMode.AGENTIC_REPLAY:
+                raise ValueError(
+                    "--agentic-drain-target-requests requires the agentic_replay "
+                    f"timing mode; scenario {self.scenario!r} locks "
+                    f"timing_mode={scenario_timing_mode}."
+                )
+        elif not _is_agentic_replay(profiling_phases):
+            raise ValueError(
+                "--agentic-drain-target-requests requires the agentic_replay "
+                "timing mode (set today by --scenario inferencex-agentx-mvp)."
+            )
+
+        for phase in profiling_phases:
+            if getattr(phase, "agentic_drain_target_requests", None) is None:
+                continue
+            if phase.concurrency is None:
+                raise ValueError(
+                    "--agentic-drain-target-requests requires --concurrency."
+                )
+            live_tree_count = phase.concurrency * phase.agentic_live_sessions
+            if phase.sessions != live_tree_count:
+                raise ValueError(
+                    "--agentic-drain-target-requests requires "
+                    "--num-conversations to equal --concurrency * "
+                    f"--agentic-live-sessions ({live_tree_count}); "
+                    f"got {phase.sessions!r}."
+                )
+            if phase.requests is not None:
+                raise ValueError(
+                    "--agentic-drain-target-requests cannot be combined with "
+                    "--request-count because a hard request cap can truncate a tree."
+                )
+            if phase.agentic_cache_warmup_duration is not None:
+                raise ValueError(
+                    "--agentic-drain-target-requests cannot be combined with "
+                    "--agentic-cache-warmup-duration because duration-based "
+                    "warmup work is not statically countable."
+                )
+            if (
+                phase.trajectory_start_min_ratio != 0
+                or phase.trajectory_start_max_ratio != 0
+            ):
+                raise ValueError(
+                    "--agentic-drain-target-requests requires turn-zero "
+                    "trajectories (--trajectory-start-min-ratio 0 and "
+                    "--trajectory-start-max-ratio 0)."
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_agentic_cache_warmup(self) -> Self:
         """Restrict accelerated cache warmup to the agentic_replay timing mode.
 
