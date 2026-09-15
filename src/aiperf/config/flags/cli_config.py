@@ -2180,7 +2180,10 @@ class CLIConfig(BaseConfig):
             "target. Selection is frozen before warmup and recorded in the output "
             "artifacts. Requires --num-conversations to equal "
             "--concurrency * --agentic-live-sessions and both trajectory start "
-            "ratios to be zero.",
+            "ratios to be zero. When omitted, trajectories use ordinary sampler "
+            "selection and normal session/duration stop behavior, including "
+            "sampler-driven recycle while admission remains open; no target set "
+            "is frozen.",
         ),
         CLIParameter(
             name=("--agentic-drain-target-requests",),

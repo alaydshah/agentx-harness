@@ -40,8 +40,11 @@ def _dataset(*, reverse: bool = False) -> DatasetMetadata:
     )
 
 
-def _source(tmp_path, *, reverse: bool = False, target: int = 100, seed: int = 42):
+def _source(
+    tmp_path, *, reverse: bool = False, target: int | None = 100, seed: int = 42
+):
     dataset = _dataset(reverse=reverse)
+    target_kwargs = {} if target is None else {"drain_target_requests": target}
     return TrajectorySource(
         dataset_metadata=dataset,
         dataset_sampler=SequentialSampler(
@@ -54,9 +57,9 @@ def _source(tmp_path, *, reverse: bool = False, target: int = 100, seed: int = 4
         start_min_ratio=0,
         start_max_ratio=0,
         warmup_requests_per_lane=1,
-        drain_target_requests=target,
         selection_artifact_dir=tmp_path,
         cache_bust_enabled=True,
+        **target_kwargs,
     )
 
 
@@ -72,6 +75,19 @@ def test_target_selection_is_stable_across_dataset_order(tmp_path) -> None:
     assert len(manifest["selected_trace_ids"]) == 3
     assert sum(manifest["selected_trace_profiling_requests"]) == 90
     assert first.next_recycle_conversation_id() is None
+
+
+def test_omitted_target_uses_sampler_selection_and_allows_recycle(tmp_path) -> None:
+    source = _source(tmp_path, target=None)
+
+    assert [trajectory.conversation_id for trajectory in source.trajectories] == [
+        "trace_11",
+        "trace_21",
+        "trace_31",
+    ]
+    assert source.drain_selection_manifest is None
+    assert source.next_recycle_conversation_id() == "trace_41"
+    assert not (tmp_path / "agentic_drain_selection.json").exists()
 
 
 def test_seed_participates_in_the_frozen_selection(tmp_path) -> None:
