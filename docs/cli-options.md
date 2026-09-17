@@ -1085,6 +1085,17 @@ AGENTIC_REPLAY only: upper bound (inclusive) on the random start position within
 <br/>_Constraints: ≥ 0.0, ≤ 1.0_
 <br/>_Default: `0.75`_
 
+#### `--agentic-live-sessions` `<int>`
+
+AGENTIC_REPLAY only: live session trees per concurrency lane (wave round-robin). With `--concurrency 3 --agentic-live-sessions 4` 12 sessions are live and each of the 3 lanes issues one main-agent turn from each of its 4 sessions in rotation, so at most 3 main-agent requests are in flight. Subagents run under their tree as usual. Default 1 = one session per lane (classic behaviour).
+<br/>_Constraints: ≥ 1_
+<br/>_Default: `1`_
+
+#### `--agentic-drain-target-requests` `<int>`
+
+AGENTIC_REPLAY only: deterministically choose the complete trace trees for the configured live session slots so their estimated profiling request count is greedily as close as possible to this target. Selection is frozen before warmup and recorded in the output artifacts. Requires --num-conversations to equal --concurrency * --agentic-live-sessions and both trajectory start ratios to be zero. When omitted, trajectories use ordinary sampler selection and normal session/duration stop behavior, including sampler-driven recycle while admission remains open; no target set is frozen.
+<br/>_Constraints: > 0_
+
 #### `--burst-phase-starts`
 
 AGENTIC_REPLAY only: collapse the WARMUP-start and PROFILING-start dispatches into synchronized bursts instead of preserving recorded spacing. By default (False), WARMUP requests are aligned globally so every trajectory reaches t* together. PROFILING subtracts one phase-wide minimum from every first request offset: the earliest request starts immediately and all other trajectories retain their recorded spacing. Pass --burst-phase-starts to subtract a separate minimum per lane, making every lane start immediately. Subsequent inter-turn delays are timing-faithful in either mode.
@@ -2619,6 +2630,17 @@ AGENTIC_REPLAY only: lower bound (inclusive) on the random start position within
 AGENTIC_REPLAY only: upper bound (inclusive) on the random start position within each trajectory, expressed as a fraction of the trace's total turn count. The effective per-trace ceiling is min(int(max_ratio * n), n - 2) so at least one profile turn remains after warmup.
 <br/>_Constraints: ≥ 0.0, ≤ 1.0_
 <br/>_Default: `0.75`_
+
+#### `--agentic-live-sessions` `<int>`
+
+AGENTIC_REPLAY only: live session trees per concurrency lane (wave round-robin). With `--concurrency 3 --agentic-live-sessions 4` 12 sessions are live and each of the 3 lanes issues one main-agent turn from each of its 4 sessions in rotation, so at most 3 main-agent requests are in flight. Subagents run under their tree as usual. Default 1 = one session per lane (classic behaviour).
+<br/>_Constraints: ≥ 1_
+<br/>_Default: `1`_
+
+#### `--agentic-drain-target-requests` `<int>`
+
+AGENTIC_REPLAY only: deterministically choose the complete trace trees for the configured live session slots so their estimated profiling request count is greedily as close as possible to this target. Selection is frozen before warmup and recorded in the output artifacts. Requires --num-conversations to equal --concurrency * --agentic-live-sessions and both trajectory start ratios to be zero. When omitted, trajectories use ordinary sampler selection and normal session/duration stop behavior, including sampler-driven recycle while admission remains open; no target set is frozen.
+<br/>_Constraints: > 0_
 
 #### `--burst-phase-starts`
 

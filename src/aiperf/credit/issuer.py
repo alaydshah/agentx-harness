@@ -132,6 +132,8 @@ class CreditIssuer:
             else None
         )
         self._issuing_stopped = False
+        self._pending_snapshot_roots: set[str] = set()
+        self._reserved_snapshot_roots: set[str] = set()
         self._max_tokens_override: int | None = None
         self._turn_admission: Callable[[TurnToSend], TurnAdmission | bool] | None = None
         self.replay_gate = ReplayIssueGate(replay_barrier)
@@ -164,6 +166,8 @@ class CreditIssuer:
     def stop_issuing(self) -> None:
         """Refuse every subsequent root and child credit."""
         self._issuing_stopped = True
+        self._pending_snapshot_roots.clear()
+        self._reserved_snapshot_roots.clear()
 
     def mark_sending_complete(self) -> None:
         """Wake the phase runner after strategy-controlled issuance ends.
@@ -194,6 +198,64 @@ class CreditIssuer:
             self._concurrency_manager.session_slot_available(self._phase_key)
             and self._stop_checker.can_start_new_session()
         )
+
+    async def reserve_snapshot_root(self, root_correlation_id: str) -> bool:
+        """Reserve one targeted-drain snapshot tree without sending a root.
+
+        Wait for configured concurrency ramp capacity without changing session
+        counters: the root is counted exactly once when it is issued. Once the
+        tree is open, the registry owns releasing its slot, including during
+        failure teardown.
+        """
+        registry = self._session_tree_registry
+        if (
+            self._issuing_stopped
+            or registry is None
+            or root_correlation_id in self._pending_snapshot_roots
+            or root_correlation_id in self._reserved_snapshot_roots
+            or registry.has_tree(root_correlation_id)
+        ):
+            return False
+        self._pending_snapshot_roots.add(root_correlation_id)
+        try:
+            acquired = await self._concurrency_manager.acquire_session_slot(
+                self._phase_key, self._stop_checker.can_start_new_session
+            )
+            if not acquired:
+                return False
+            try:
+                registry.open_tree(
+                    root_correlation_id, self._phase_key, root_pending=True
+                )
+            except BaseException:
+                self._concurrency_manager.release_session_slot(self._phase_key)
+                raise
+            self._reserved_snapshot_roots.add(root_correlation_id)
+            return True
+        finally:
+            self._pending_snapshot_roots.discard(root_correlation_id)
+
+    def _session_slot_requirements(
+        self,
+        turn: TurnToSend,
+        *,
+        is_session_start: bool,
+        is_child: bool,
+    ) -> tuple[bool, bool]:
+        """Return whether a root is reserved and whether it needs a new slot."""
+        is_root_start = is_session_start and not is_child
+        is_reserved = (
+            is_root_start
+            and turn.effective_root_correlation_id in self._reserved_snapshot_roots
+        )
+        return is_reserved, is_root_start and not is_reserved
+
+    def _consume_snapshot_root_reservation(
+        self, turn: TurnToSend, is_reserved: bool
+    ) -> None:
+        """Transfer a successful reserved-root admission to normal issuance."""
+        if is_reserved:
+            self._reserved_snapshot_roots.remove(turn.effective_root_correlation_id)
 
     async def acquire_lane_credit(
         self,
@@ -277,9 +339,7 @@ class CreditIssuer:
             self._phase != CreditPhase.PROFILING
             or self._session_tree_registry is None
             or turn.root_correlation_id is None
-            or self._session_tree_registry.has_tree(
-                turn.effective_root_correlation_id
-            )
+            or self._session_tree_registry.has_tree(turn.effective_root_correlation_id)
         )
 
     def release_lane_credit(self) -> None:
@@ -383,7 +443,11 @@ class CreditIssuer:
         # first credit in the phase (turn 0, or a mid-trace resume). DAG
         # children inherit the root's slot and must not acquire their own —
         # fanout would otherwise consume the user's configured session budget.
-        needs_session_slot = is_session_start and not is_child
+        reserved_snapshot_root, needs_session_slot = self._session_slot_requirements(
+            turn,
+            is_session_start=is_session_start,
+            is_child=is_child,
+        )
         if needs_session_slot:
             acquired = await self._concurrency_manager.acquire_session_slot(
                 self._phase_key, self._stop_checker.can_start_new_session
@@ -416,6 +480,7 @@ class CreditIssuer:
             self._open_session_tree(turn)
 
         # Slots acquired - proceed with credit issuance
+        self._consume_snapshot_root_reservation(turn, reserved_snapshot_root)
         return await self._issue_credit_internal(turn)
 
     async def try_issue_credit(self, turn: TurnToSend) -> bool | None:
@@ -449,7 +514,11 @@ class CreditIssuer:
         if not can_proceed_fn():
             return False
 
-        needs_session_slot = is_session_start and not is_child
+        reserved_snapshot_root, needs_session_slot = self._session_slot_requirements(
+            turn,
+            is_session_start=is_session_start,
+            is_child=is_child,
+        )
         if needs_session_slot:
             acquired = self._concurrency_manager.try_acquire_session_slot(
                 self._phase_key, can_proceed_fn
@@ -477,6 +546,7 @@ class CreditIssuer:
         if needs_session_slot:
             self._open_session_tree(turn)
 
+        self._consume_snapshot_root_reservation(turn, reserved_snapshot_root)
         return await self._issue_credit_internal(turn)
 
     async def _issue_credit_internal(self, turn: TurnToSend) -> bool:

@@ -480,6 +480,13 @@ written to every record in `profile_export.jsonl` (in the artifact
 directory), so `aiperf analyze swim-lane` groups each tree under one lane and
 renders exactly `--concurrency` slots as a per-lane timeline.
 
+For a deterministic request-target drain, a resumed snapshot descendant may
+have an earlier recorded dispatch time than its root. AIPerf reserves that
+lane's tree slot before scheduling either stream, without sending or counting
+the root early. Time spent waiting for ramp capacity consumes the recorded
+phase-relative offset rather than shifting the replay later. Root-session
+accounting remains unchanged.
+
 When a tree drains, the lane recycles by drawing the next root from the **dataset
 sampler** (the same sampler that built the initial trajectories, honoring the
 dataset's `sampling_strategy`). As long as the corpus is larger than the

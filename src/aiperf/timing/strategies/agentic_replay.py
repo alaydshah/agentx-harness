@@ -199,23 +199,15 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         # every existing path untouched (``isinstance`` guards MagicMock configs).
         live_sessions = getattr(config, "agentic_live_sessions", 1)
         self._live_sessions_per_lane: int = (
-            live_sessions
-            if isinstance(live_sessions, int) and live_sessions > 1
-            else 1
+            live_sessions if isinstance(live_sessions, int) and live_sessions > 1 else 1
         )
         self._lane_gate: LaneRotationGate | None = None
         self._cache_warmup_requests_by_lane: Counter[int] = Counter()
-        self._cache_warmup_selected_by_lane: dict[
-            int, set[tuple[str, str, int]]
-        ] = {}
-        self._cache_warmup_admitted_by_lane: dict[
-            int, set[tuple[str, str, int]]
-        ] = {}
+        self._cache_warmup_selected_by_lane: dict[int, set[tuple[str, str, int]]] = {}
+        self._cache_warmup_admitted_by_lane: dict[int, set[tuple[str, str, int]]] = {}
         self._cache_warmup_request_budget_reached = False
         self._baseline_warmup_admitted = 0
-        self._quota_handoff_turns: dict[
-            tuple[str, str, str, int], TurnToSend
-        ] = {}
+        self._quota_handoff_turns: dict[tuple[str, str, str, int], TurnToSend] = {}
         self._baseline_warmup_returns: dict[str, Credit] = {}
         self._baseline_correlations: set[str] = set()
         self._baseline_warmup_turns: set[tuple[str, int]] = set()
@@ -365,6 +357,41 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 None,
             )
         )
+
+    def _targeted_drain_active(self) -> bool:
+        """Return active target mode after checking shared-source consistency."""
+        phase_target = getattr(self.config, "agentic_drain_target_requests", None)
+        source_target = getattr(
+            self.conversation_source, "_drain_target_requests", None
+        )
+        phase_target = phase_target if type(phase_target) is int else None
+        source_target = source_target if type(source_target) is int else None
+        if phase_target != source_target:
+            raise RuntimeError(
+                "Agentic Replay drain target differs between the active "
+                f"profiling phase ({phase_target!r}) and trajectory source "
+                f"({source_target!r})"
+            )
+        if phase_target is not None:
+            phase_tree_count = getattr(self.config, "concurrency", None)
+            source_tree_count = getattr(self.conversation_source, "_target_size", None)
+            phase_live_sessions = getattr(self.config, "agentic_live_sessions", None)
+            source_live_sessions = getattr(
+                self.conversation_source, "_live_sessions_per_lane", None
+            )
+            if (
+                phase_tree_count != source_tree_count
+                or phase_live_sessions != source_live_sessions
+            ):
+                raise RuntimeError(
+                    "Agentic Replay targeted tree shape differs between the "
+                    "active profiling phase "
+                    f"(trees={phase_tree_count!r}, "
+                    f"live_sessions={phase_live_sessions!r}) and trajectory "
+                    f"source (trees={source_tree_count!r}, "
+                    f"live_sessions={source_live_sessions!r})"
+                )
+        return phase_target is not None
 
     def _seed_trajectory_replay_prefix(self, trajectory: Trajectory) -> None:
         """Seed the exact completed history before a resumed phase dispatches."""
@@ -542,9 +569,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             start = completed.get(conversation_id, 0)
             for turn_index in range(start, len(metadata.turns)):
                 turn = metadata.turns[turn_index]
-                timestamp_ms = _as_timestamp_ms(
-                    getattr(turn, "timestamp_ms", None)
-                )
+                timestamp_ms = _as_timestamp_ms(getattr(turn, "timestamp_ms", None))
                 candidates.append(
                     (
                         (
@@ -1118,9 +1143,7 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
         if more is not False:
             return
         if self.branch_orchestrator is not None:
-            await self.branch_orchestrator.on_child_stopped(
-                turn.x_correlation_id
-            )
+            await self.branch_orchestrator.on_child_stopped(turn.x_correlation_id)
         raise RuntimeError(
             "required Agentic Replay snapshot descendant was refused: "
             f"conversation={turn.conversation_id!r} "
@@ -1913,15 +1936,45 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
             )
         else:
             t0_offset_ms = phase_t0_offset_ms
+        dispatch_started_at = time.perf_counter()
+        targeted_drain = self._targeted_drain_active()
+
+        # Target mode freezes its complete tree set and never recycles roots.
+        # A snapshot child may have an earlier deadline than its root or pass a
+        # root blocked on prefill admission. Reserve the tree before seeding or
+        # scheduling descendants, without issuing or counting the root early.
+        if (
+            self._has_tree_registry
+            and targeted_drain
+            and any(state.agent_depth > 0 for state in snapshot.states)
+            and any(
+                state.agent_depth == 0 and not state.waiting_on_children
+                for state in snapshot.states
+            )
+        ):
+            lane_root_corr = self._lane_root_corr(snapshot)
+            if (
+                lane_root_corr is None
+                or not await self.credit_issuer.reserve_snapshot_root(lane_root_corr)
+            ):
+                raise RuntimeError(
+                    "Agentic Replay snapshot root reservation refused: "
+                    f"lane={lane} root={lane_root_corr!r}"
+                )
 
         if self.branch_orchestrator is not None:
+            dispatch_elapsed_ms = (
+                time.perf_counter() - dispatch_started_at
+            ) * MILLIS_PER_SECOND
             self.branch_orchestrator.seed_snapshot(
                 snapshot.states,
                 cache_bust_markers=self._session_marker,
                 join_release_delays_ms={
                     state.x_correlation_id: max(
                         0.0,
-                        offset_by_corr[state.x_correlation_id] - t0_offset_ms,
+                        offset_by_corr[state.x_correlation_id]
+                        - t0_offset_ms
+                        - dispatch_elapsed_ms,
                     )
                     for state in snapshot.states
                     if state.waiting_on_children
@@ -2006,9 +2059,13 @@ class AgenticReplayStrategy(AIPerfLoggerMixin):
                 if turn.agent_depth > 0
                 else self._issue_required_root_turn(turn)
             )
-            delay_s = (
+            replay_delay_s = (
                 offset_by_corr[state.x_correlation_id] - t0_offset_ms
             ) / MILLIS_PER_SECOND
+            delay_s = max(
+                0.0,
+                replay_delay_s - (time.perf_counter() - dispatch_started_at),
+            )
             if delay_s > 0:
                 self.scheduler.schedule_later(
                     delay_s,
